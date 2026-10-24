@@ -9,6 +9,7 @@ public record EncryptionJobView(
         UUID id,
         String status,
         String database,
+        int parallelism,
         List<String> tables,
         String currentTable,
         long totalRows,

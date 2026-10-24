@@ -26,8 +26,15 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletionService;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -39,6 +46,8 @@ public class EncryptionJobService {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(EncryptionJobService.class);
     private static final int DEFAULT_BATCH_SIZE = 1000;
+    private static final int DEFAULT_PARALLELISM = 4;
+    private static final int MAX_IDS_PER_BATCH = 900;
     private static final int MAX_RETAINED_JOBS = 100;
     private static final Pattern SAFE_IDENTIFIER = Pattern.compile("[A-Za-z][A-Za-z0-9_$#]*");
     private static final Map<String, String> JDBC_DRIVER_PREFIXES = Map.of(
@@ -75,7 +84,8 @@ public class EncryptionJobService {
     }
 
     public synchronized EncryptionJobView start(EncryptionJobRequest request) {
-        DatabaseTarget target = databaseTarget(request.connection());
+        int parallelism = request.parallelism() == null ? DEFAULT_PARALLELISM : request.parallelism();
+        DatabaseTarget target = databaseTarget(request.connection(), parallelism);
         try {
             List<TableSpec> selectedTables = resolveTables(target, request.tables());
             int batchSize = request.batchSize() == null ? DEFAULT_BATCH_SIZE : request.batchSize();
@@ -84,6 +94,7 @@ public class EncryptionJobService {
                     target.name,
                     selectedTables,
                     batchSize,
+                    parallelism,
                     target.jdbcTemplate,
                     target
             );
@@ -106,7 +117,7 @@ public class EncryptionJobService {
         }
     }
 
-    private DatabaseTarget databaseTarget(EncryptionDatabaseRequest connection) {
+    private DatabaseTarget databaseTarget(EncryptionDatabaseRequest connection, int parallelism) {
         if (connection == null) {
             return new DatabaseTarget("default", dataSource, jdbcTemplate, null);
         }
@@ -117,7 +128,7 @@ public class EncryptionJobService {
         targetDataSource.setPassword(connection.password());
         targetDataSource.setDriverClassName(connection.driver());
         targetDataSource.setPoolName("pii-encryption-" + UUID.randomUUID().toString().substring(0, 8));
-        targetDataSource.setMaximumPoolSize(2);
+        targetDataSource.setMaximumPoolSize(parallelism + 1);
         targetDataSource.setMinimumIdle(0);
         targetDataSource.setConnectionTimeout(10_000);
         return new DatabaseTarget(database, targetDataSource, new JdbcTemplate(targetDataSource), targetDataSource);
@@ -383,13 +394,28 @@ public class EncryptionJobService {
 
     private void run(MutableJob job) {
         job.start();
+        ExecutorService workers = Executors.newFixedThreadPool(job.parallelism, runnable -> {
+            Thread thread = new Thread(runnable, "pii-encryption-worker-" + job.id.toString().substring(0, 8));
+            thread.setDaemon(false);
+            return thread;
+        });
         try {
             for (TableSpec table : job.tables) {
                 job.setCurrentTable(table.identity.qualifiedName());
-                encryptTable(job, table);
+                encryptTable(job, table, workers);
             }
+            workers.shutdown();
+            workers.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
             job.succeed();
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            workers.shutdownNow();
+            awaitWorkers(workers);
+            LOGGER.error("Encryption job {} was interrupted", job.id, exception);
+            job.fail("Database encryption was interrupted.");
         } catch (Exception exception) {
+            workers.shutdownNow();
+            awaitWorkers(workers);
             LOGGER.error("Encryption job {} failed", job.id, exception);
             job.fail("Database encryption failed; inspect server logs.");
         } finally {
@@ -397,49 +423,95 @@ public class EncryptionJobService {
         }
     }
 
-    private void encryptTable(MutableJob job, TableSpec table) {
-        String sql = selectSql(table);
+    private void encryptTable(MutableJob job, TableSpec table, ExecutorService workers)
+            throws InterruptedException, ExecutionException {
+        CompletionService<Void> completionService = new ExecutorCompletionService<>(workers);
+        List<Future<Void>> outstanding = new ArrayList<>();
+        int maxOutstanding = job.parallelism * 2;
         long afterId = Long.MIN_VALUE;
         long processedRows = 0;
         while (true) {
-            if (table.maxRows != null && processedRows >= table.maxRows) {
-                return;
+            if (Thread.currentThread().isInterrupted()) {
+                throw new InterruptedException("Encryption job interrupted");
             }
             int currentBatchSize = table.maxRows == null
-                    ? job.batchSize
-                    : (int) Math.min(job.batchSize, table.maxRows - processedRows);
+                    ? Math.min(job.batchSize, MAX_IDS_PER_BATCH)
+                    : (int) Math.min(Math.min(job.batchSize, MAX_IDS_PER_BATCH), table.maxRows - processedRows);
+            if (currentBatchSize <= 0) {
+                break;
+            }
             long cursor = afterId;
-            List<EncryptionRow> rows = job.jdbcTemplate.query(
-                    sql,
+            List<Long> ids = job.jdbcTemplate.query(
+                    selectIdsSql(table),
                     statement -> {
                         statement.setLong(1, cursor);
                         statement.setMaxRows(currentBatchSize);
                         statement.setFetchSize(currentBatchSize);
                     },
-                    (ResultSet resultSet, int rowNumber) -> readRow(resultSet, table)
+                    (ResultSet resultSet, int rowNumber) -> resultSet.getLong(1)
             );
-            if (rows.isEmpty()) {
-                return;
+            if (ids.isEmpty()) {
+                break;
             }
+            afterId = ids.getLast();
+            processedRows += ids.size();
 
-            List<EncryptedRow> encryptedRows = new ArrayList<>(rows.size());
-            long encryptedValues = 0;
-            for (EncryptionRow row : rows) {
-                List<String> values = new ArrayList<>(row.values.size());
-                for (int index = 0; index < row.values.size(); index++) {
-                    String value = row.values.get(index);
-                    if (value != null) {
-                        String encryptedValue = encryptionService.encrypt(value, table.purpose(index));
-                        if (!encryptedValue.equals(value)) {
-                            encryptedValues++;
-                        }
-                        value = encryptedValue;
+            List<Long> batchIds = List.copyOf(ids);
+            outstanding.add(completionService.submit(() -> {
+                encryptBatch(job, table, batchIds);
+                return null;
+            }));
+            if (outstanding.size() >= maxOutstanding) {
+                awaitCompleted(completionService, outstanding);
+            }
+        }
+        while (!outstanding.isEmpty()) {
+            awaitCompleted(completionService, outstanding);
+        }
+    }
+
+    private void awaitCompleted(
+            CompletionService<Void> completionService,
+            List<Future<Void>> outstanding
+    ) throws InterruptedException, ExecutionException {
+        Future<Void> completed = completionService.take();
+        outstanding.remove(completed);
+        completed.get();
+    }
+
+    private void encryptBatch(MutableJob job, TableSpec table, List<Long> ids) {
+        List<EncryptionRow> rows = job.jdbcTemplate.query(
+                selectRowsSql(table, ids.size()),
+                statement -> {
+                    int parameterIndex = 1;
+                    for (Long id : ids) {
+                        statement.setLong(parameterIndex++, id);
                     }
-                    values.add(value);
-                }
-                encryptedRows.add(new EncryptedRow(row.id, values));
-            }
+                    statement.setMaxRows(ids.size());
+                    statement.setFetchSize(ids.size());
+                },
+                (ResultSet resultSet, int rowNumber) -> readRow(resultSet, table)
+        );
 
+        List<EncryptedRow> encryptedRows = new ArrayList<>(rows.size());
+        long encryptedValues = 0;
+        for (EncryptionRow row : rows) {
+            List<String> values = new ArrayList<>(row.values.size());
+            for (int index = 0; index < row.values.size(); index++) {
+                String value = row.values.get(index);
+                if (value != null) {
+                    String encryptedValue = encryptionService.encrypt(value, table.purpose(index));
+                    if (!encryptedValue.equals(value)) {
+                        encryptedValues++;
+                    }
+                    value = encryptedValue;
+                }
+                values.add(value);
+            }
+            encryptedRows.add(new EncryptedRow(row.id, values));
+        }
+
+        if (!encryptedRows.isEmpty()) {
             job.jdbcTemplate.batchUpdate(updateSql(table), new BatchPreparedStatementSetter() {
                 @Override
                 public void setValues(PreparedStatement statement, int index) throws SQLException {
@@ -460,11 +532,8 @@ public class EncryptionJobService {
                     return encryptedRows.size();
                 }
             });
-
-            afterId = rows.getLast().id;
-            processedRows += rows.size();
-            job.addProgress(table.identity.qualifiedName(), rows.size(), encryptedValues);
         }
+        job.addProgress(table.identity.qualifiedName(), rows.size(), encryptedValues);
     }
 
     private EncryptionRow readRow(ResultSet resultSet, TableSpec table) throws SQLException {
@@ -475,14 +544,36 @@ public class EncryptionJobService {
         return new EncryptionRow(resultSet.getLong(1), values);
     }
 
-    private String selectSql(TableSpec table) {
-        String selections = table.columns.stream()
-                .map(column -> quote(table.quote, column.name))
-                .collect(Collectors.joining(", "));
-        return "SELECT " + quote(table.quote, table.idColumn) + ", " + selections
+    private String selectIdsSql(TableSpec table) {
+        return "SELECT " + quote(table.quote, table.idColumn)
                 + " FROM " + table.identity.quotedName(table.quote)
                 + " WHERE " + quote(table.quote, table.idColumn) + " > ? AND (" + unencryptedPredicate(table) + ")"
                 + " ORDER BY " + quote(table.quote, table.idColumn);
+    }
+
+    private String selectRowsSql(TableSpec table, int idCount) {
+        String selections = table.columns.stream()
+                .map(column -> quote(table.quote, column.name))
+                .collect(Collectors.joining(", "));
+        String placeholders = String.join(", ", java.util.Collections.nCopies(idCount, "?"));
+        return "SELECT " + quote(table.quote, table.idColumn) + ", " + selections
+                + " FROM " + table.identity.quotedName(table.quote)
+                + " WHERE " + quote(table.quote, table.idColumn) + " IN (" + placeholders + ")"
+                + " AND (" + unencryptedPredicate(table) + ")";
+    }
+
+    private void awaitWorkers(ExecutorService workers) {
+        boolean interrupted = false;
+        while (!workers.isTerminated()) {
+            try {
+                workers.awaitTermination(1, TimeUnit.DAYS);
+            } catch (InterruptedException exception) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private long countProcessableRows(JdbcTemplate targetJdbcTemplate, TableSpec table) {
@@ -572,6 +663,7 @@ public class EncryptionJobService {
         private final String database;
         private final List<TableSpec> tables;
         private final int batchSize;
+        private final int parallelism;
         private final JdbcTemplate jdbcTemplate;
         private final DatabaseTarget target;
         private final Instant createdAt = Instant.now();
@@ -590,6 +682,7 @@ public class EncryptionJobService {
                 String database,
                 List<TableSpec> tables,
                 int batchSize,
+                int parallelism,
                 JdbcTemplate jdbcTemplate,
                 DatabaseTarget target
         ) {
@@ -597,6 +690,7 @@ public class EncryptionJobService {
             this.database = database;
             this.tables = tables;
             this.batchSize = batchSize;
+            this.parallelism = parallelism;
             this.jdbcTemplate = jdbcTemplate;
             this.target = target;
         }
@@ -639,6 +733,7 @@ public class EncryptionJobService {
                     id,
                     status,
                     database,
+                    parallelism,
                     tables.stream().map(table -> table.identity.qualifiedName()).toList(),
                     currentTable,
                     tables.stream().mapToLong(TableSpec::rowsToProcess).sum(),

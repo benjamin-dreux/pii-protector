@@ -11,6 +11,8 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 
 @Service
 public class PiiEncryptionService {
@@ -19,11 +21,12 @@ public class PiiEncryptionService {
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private static final String DIGIT_ALPHABET = "0123456789";
     private static final int KEY_LENGTH_BYTES = 32;
+    private static final int MAX_PARALLEL_WORKERS = 16;
 
-    private final FPEFF1Engine alphanumericEncryptEngine;
-    private final FPEFF1Engine alphanumericDecryptEngine;
-    private final FPEFF1Engine numericEncryptEngine;
-    private final FPEFF1Engine numericDecryptEngine;
+    private final BlockingQueue<FPEFF1Engine> alphanumericEncryptEngines;
+    private final BlockingQueue<FPEFF1Engine> alphanumericDecryptEngines;
+    private final BlockingQueue<FPEFF1Engine> numericEncryptEngines;
+    private final BlockingQueue<FPEFF1Engine> numericDecryptEngines;
 
     public PiiEncryptionService(@Value("${pii.encryption.key:}") String encodedKey) {
         if (encodedKey.isBlank()) {
@@ -41,10 +44,10 @@ public class PiiEncryptionService {
         if (keyBytes.length != KEY_LENGTH_BYTES) {
             throw new IllegalStateException("pii.encryption.key must decode to exactly 32 bytes");
         }
-        alphanumericEncryptEngine = createEngine(keyBytes, ALPHANUMERIC_ALPHABET, true);
-        alphanumericDecryptEngine = createEngine(keyBytes, ALPHANUMERIC_ALPHABET, false);
-        numericEncryptEngine = createEngine(keyBytes, DIGIT_ALPHABET, true);
-        numericDecryptEngine = createEngine(keyBytes, DIGIT_ALPHABET, false);
+        alphanumericEncryptEngines = createEnginePool(keyBytes, ALPHANUMERIC_ALPHABET, true);
+        alphanumericDecryptEngines = createEnginePool(keyBytes, ALPHANUMERIC_ALPHABET, false);
+        numericEncryptEngines = createEnginePool(keyBytes, DIGIT_ALPHABET, true);
+        numericDecryptEngines = createEnginePool(keyBytes, DIGIT_ALPHABET, false);
     }
 
     public String encrypt(String plaintext, String purpose) {
@@ -93,9 +96,20 @@ public class PiiEncryptionService {
         }
 
         byte[] output = new byte[input.length];
-        FPEFF1Engine engine = engine(numericAlphabet, encrypt);
-        synchronized (engine) {
+        BlockingQueue<FPEFF1Engine> engines = engines(numericAlphabet, encrypt);
+        FPEFF1Engine engine;
+        try {
+            engine = engines.take();
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting for an FF1 engine", exception);
+        }
+        try {
             engine.processBlock(input, 0, input.length, output, 0);
+        } finally {
+            if (!engines.offer(engine)) {
+                throw new IllegalStateException("FF1 engine pool returned an engine more than once");
+            }
         }
 
         for (int index = 0; index < positions.size(); index++) {
@@ -108,22 +122,26 @@ public class PiiEncryptionService {
         return column.equals("date_of_birth") || column.equals("phone_number") || column.equals("extension");
     }
 
-    private FPEFF1Engine engine(boolean numericAlphabet, boolean encrypt) {
+    private BlockingQueue<FPEFF1Engine> engines(boolean numericAlphabet, boolean encrypt) {
         if (numericAlphabet) {
-            return encrypt ? numericEncryptEngine : numericDecryptEngine;
+            return encrypt ? numericEncryptEngines : numericDecryptEngines;
         }
-        return encrypt ? alphanumericEncryptEngine : alphanumericDecryptEngine;
+        return encrypt ? alphanumericEncryptEngines : alphanumericDecryptEngines;
     }
 
-    private FPEFF1Engine createEngine(byte[] keyBytes, String alphabet, boolean encrypt) {
-        BlockCipher aes = AESEngine.newInstance();
-        FPEFF1Engine engine = new FPEFF1Engine(aes);
-        engine.init(encrypt, new FPEParameters(
-                new KeyParameter(keyBytes),
-                alphabet.length(),
-                new byte[0]
-        ));
-        return engine;
+    private BlockingQueue<FPEFF1Engine> createEnginePool(byte[] keyBytes, String alphabet, boolean encrypt) {
+        BlockingQueue<FPEFF1Engine> engines = new ArrayBlockingQueue<>(MAX_PARALLEL_WORKERS);
+        for (int index = 0; index < MAX_PARALLEL_WORKERS; index++) {
+            BlockCipher aes = AESEngine.newInstance();
+            FPEFF1Engine engine = new FPEFF1Engine(aes);
+            engine.init(encrypt, new FPEParameters(
+                    new KeyParameter(keyBytes),
+                    alphabet.length(),
+                    new byte[0]
+            ));
+            engines.add(engine);
+        }
+        return engines;
     }
 
 }

@@ -183,6 +183,60 @@ class EncryptionJobServiceTest {
         }
     }
 
+    @Test
+    void runsBatchesOfOneJobConcurrentlyWithIndependentWorkers() throws Exception {
+        for (long id = 2; id <= 4; id++) {
+            defaultJdbcTemplate.update(
+                    "INSERT INTO contacts (contact_id, display_name) VALUES (?, ?)",
+                    id,
+                    "Parallel Contact " + id
+            );
+        }
+
+        CountDownLatch twoWorkersEncrypting = new CountDownLatch(2);
+        CountDownLatch allowEncryptionToContinue = new CountDownLatch(1);
+        PiiEncryptionService blockingEncryptionService = new PiiEncryptionService(TEST_KEY) {
+            @Override
+            public String encrypt(String plaintext, String purpose) {
+                twoWorkersEncrypting.countDown();
+                try {
+                    if (!allowEncryptionToContinue.await(5, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("One job did not use two encryption workers");
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted while waiting for encryption", exception);
+                }
+                return super.encrypt(plaintext, purpose);
+            }
+        };
+
+        ExecutorService jobExecutor = Executors.newSingleThreadExecutor();
+        try {
+            EncryptionJobService service = service(jobExecutor, blockingEncryptionService);
+            EncryptionJobRequest request = new EncryptionJobRequest(
+                    List.of(new EncryptionTableRequest(null, "contacts", List.of("display_name"), 4L)),
+                    1,
+                    null,
+                    2
+            );
+            EncryptionJobView job = service.start(request);
+
+            assertThat(twoWorkersEncrypting.await(5, TimeUnit.SECONDS)).isTrue();
+            allowEncryptionToContinue.countDown();
+
+            EncryptionJobView completed = awaitCompletion(service, job.id());
+            assertThat(completed.status()).isEqualTo("SUCCEEDED");
+            assertThat(completed.parallelism()).isEqualTo(2);
+            assertThat(completed.processedRows()).isEqualTo(4);
+            assertThat(completed.processedRowsByTable()).containsEntry("PUBLIC.CONTACTS", 4L);
+        } finally {
+            allowEncryptionToContinue.countDown();
+            jobExecutor.shutdown();
+            assertThat(jobExecutor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
     private EncryptionJobService service(
             java.util.concurrent.Executor executor,
             PiiEncryptionService encryptionService
@@ -194,7 +248,8 @@ class EncryptionJobServiceTest {
         return new EncryptionJobRequest(
                 List.of(new EncryptionTableRequest(null, "contacts", List.of("display_name"), 1L)),
                 1,
-                connection
+                connection,
+                1
         );
     }
 

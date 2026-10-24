@@ -11,6 +11,7 @@ import java.util.List;
 public record EncryptionJobRequest(
         @NotEmpty @Size(max = 50) List<@Valid EncryptionTableRequest> tables,
         @Min(1) @Max(10000) Integer batchSize,
-        @Valid EncryptionDatabaseRequest connection
+        @Valid EncryptionDatabaseRequest connection,
+        @Min(1) @Max(8) Integer parallelism
 ) {
 }
