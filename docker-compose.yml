@@ -1,0 +1,108 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME: http://localhost:8181
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "127.0.0.1:8181:8080"
+    volumes:
+      - ./docker_volumes/keycloak:/opt/keycloak/data
+      - ./docker/keycloak/pii-protector-realm.json:/opt/keycloak/data/import/pii-protector-realm.json:ro
+
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: pii_protector
+      POSTGRES_USER: pii
+      POSTGRES_PASSWORD: pii_dev_only
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./docker_volumes/postgres:/var/lib/postgresql
+      - ./bin/sql/postgres-init.sql:/docker-entrypoint-initdb.d/10-pii-samples.sql:ro
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: "PiiProtector!Dev2026"
+    ports:
+      - "1433:1433"
+    volumes:
+      - ./docker_volumes/sqlserver:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q \"SELECT 1\" >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  sqlserver-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    volumes:
+      - ./bin/sql/sqlserver-init.sql:/init/sqlserver-init.sql:ro
+    command:
+      - >
+        /opt/mssql-tools18/bin/sqlcmd -b -S sqlserver -U sa
+        -P "$$MSSQL_SA_PASSWORD" -C -i /init/sqlserver-init.sql
+    environment:
+      MSSQL_SA_PASSWORD: "PiiProtector!Dev2026"
+    restart: "no"
+
+  oracle:
+    image: gvenzl/oracle-free:23-slim-faststart
+    environment:
+      ORACLE_PASSWORD: "PiiProtector!Dev2026"
+      APP_USER: pii
+      APP_USER_PASSWORD: pii_dev_only
+    ports:
+      - "1521:1521"
+    volumes:
+      - ./docker_volumes/oracle:/opt/oracle/oradata
+      - ./bin/sql/oracle-init.sql:/container-entrypoint-initdb.d/10-pii-samples.sql:ro
+
+  db2:
+    image: icr.io/db2_community/db2:12.1.2.0
+    platform: linux/amd64
+    privileged: true
+    environment:
+      LICENSE: accept
+      DB2INST1_PASSWORD: "PiiProtector!Dev2026"
+      DBNAME: pii_protector
+    ports:
+      - "50000:50000"
+    volumes:
+      - ./docker_volumes/db2:/database
+    healthcheck:
+      test: ["CMD-SHELL", "su - db2inst1 -c 'db2 connect to pii_protector && db2 terminate' >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      retries: 60
+
+  db2-init:
+    image: icr.io/db2_community/db2:12.1.2.0
+    platform: linux/amd64
+    privileged: true
+    depends_on:
+      db2:
+        condition: service_healthy
+    environment:
+      LICENSE: accept
+      DB2INST1_PASSWORD: "PiiProtector!Dev2026"
+    volumes:
+      - ./bin/sql/db2-init.sh:/var/custom/pii-init.sh:ro
+      - ./bin/sql/db2-init.sql:/var/custom/pii-samples.sql:ro
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - "su - db2inst1 -c 'DB2INST1_PASSWORD=PiiProtector!Dev2026 exec /var/custom/pii-init.sh'"
+    restart: "no"

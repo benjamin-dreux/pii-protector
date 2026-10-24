@@ -1,0 +1,39 @@
+{
+  "realm": "pii-protector",
+  "enabled": true,
+  "clients": [
+    {
+      "clientId": "pii-protector-admin",
+      "name": "PII Protector administrative API",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "pii-protector-dev-only-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "defaultClientScopes": [
+        "web-origins",
+        "acr",
+        "roles",
+        "profile",
+        "email",
+        "pii.jobs"
+      ],
+      "optionalClientScopes": []
+    }
+  ],
+  "clientScopes": [
+    {
+      "name": "pii.jobs",
+      "description": "Permission to start and monitor encryption jobs",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    }
+  ]
+}
